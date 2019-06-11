@@ -172,17 +172,13 @@ class Explainer():
         means = X.mean().to_dict()
 
         return pd.DataFrame({
-            col: dict(zip(
-                self.taus,
-                [
-                    tau * (
-                        (means[col] - q_mins[col])
-                        if tau < 0 else
-                        (q_maxs[col] - means[col])
-                    )
-                    for tau in taus
-                ]
-            ))
+            col: {
+                tau: tau * (
+                    (means[col] - q_mins[col]) if tau < 0
+                    else (q_maxs[col] - means[col])
+                )
+                for tau in taus
+            }
             for col in X.columns
         })
 
@@ -230,6 +226,12 @@ class Explainer():
 
         return self
 
+    def nominal_values(self, X):
+        return pd.DataFrame({
+            col: X[col].mean() + self.epsilons[col]
+            for col in X.columns
+        }, index=pd.Index(self.taus, name=r'$\tau$'))
+
     def explain_predictions(self, X, y_pred):
         """Returns a DataFrame containing average predictions for each (column, tau) pair.
 
@@ -257,15 +259,8 @@ class Explainer():
             names=['labels', 'features']
         )
 
-        # If there is single feature we can index with epsilons instead of taus
-        if len(X.columns) == 1:
-            feature = X.columns[0]
-            mean = X[feature].mean()
-            preds.index = [mean + eps for eps in self.epsilons[feature]]
-            preds.index.name = feature
-        else:
-            preds.index = self.taus
-            preds.index.name = r'$\tau$'
+        preds.index = self.taus
+        preds.index.name = r'$\tau$'
 
         # Remove unnecessary column levels
         if len(preds.columns.unique('labels')) == 1:
@@ -273,8 +268,6 @@ class Explainer():
         if isinstance(preds.columns, pd.MultiIndex) and len(preds.columns.unique('features')) == 1:
             preds.columns = preds.columns.droplevel('features')
 
-        if len(preds.columns) == 1:
-            return preds[preds.columns[0]]
         return preds
 
     def plot_predictions(self, X, y_pred, ax=None):
@@ -287,8 +280,6 @@ class Explainer():
 
         """
         means = self.explain_predictions(X=X, y_pred=y_pred)
-        if isinstance(means, pd.Series):
-            means = means.to_frame()
 
         # Create a plot if none has been provided
         ax = plt.axes() if ax is None else ax
@@ -296,9 +287,15 @@ class Explainer():
         def to_label(col):
             if isinstance(col, tuple):
                 return f'{col[0]} - {col[1]}'
+            return col
 
-        for col in means.columns:
-            ax.plot(means[col], label=to_label(col))
+        if len(means.columns) == 1:
+            col = means.columns[0]
+            x = self.nominal_values(X)[col]
+            ax.plot(x, means[col].values, label=to_label(col))
+        else:
+            for col in means.columns:
+                ax.plot(means[col], label=to_label(col))
 
         # Add the legend if necessary
         if len(means.columns) > 1:
