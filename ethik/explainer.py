@@ -98,6 +98,12 @@ def compute_performance(y_test, y_pred, metric, x, lambdas):
     }
 
 
+def metric_to_col(metric):
+    # TODO: what about lambda metrics?
+    # TODO: use a prefix to avoid conflicts with other columns?
+    return metric.__name__
+
+
 class Explainer:
     """Explains the bias and reliability of model predictions.
 
@@ -115,15 +121,8 @@ class Explainer:
 
     """
 
-    _metadata = ["alpha", "n_taus", "max_iterations", "n_jobs", "verbose"]
-
     def __init__(
-        self,
-        alpha=0.05,
-        n_taus=41,
-        max_iterations=5,
-        n_jobs=-1,
-        verbose=False
+        self, alpha=0.05, n_taus=41, max_iterations=5, n_jobs=-1, verbose=False
     ):
         if not 0 < alpha < 0.5:
             raise ValueError("alpha must be between 0 and 0.5, got " f"{alpha}")
@@ -145,7 +144,10 @@ class Explainer:
         self.max_iterations = max_iterations
         self.n_jobs = n_jobs
         self.verbose = verbose
-        self.info = pd.DataFrame(columns=["feature", "tau", "value", "lambda", "label", "bias"])
+        self.metric_cols = set()
+        self.info = pd.DataFrame(
+            columns=["feature", "tau", "value", "lambda", "label", "bias"]
+        )
 
     @property
     def taus(self):
@@ -213,7 +215,7 @@ class Explainer:
         lambdas = joblib.Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
             joblib.delayed(compute_lambdas)(
                 x=X_test[col],
-                target_means=part["value"].unique().to_numpy(),
+                target_means=part["value"].unique(),
                 max_iterations=self.max_iterations,
             )
             for col, part in self.info.groupby("feature")
@@ -286,9 +288,10 @@ class Explainer:
                 metrics from scikit-learn will work.
 
         """
-        metric_name = metric.__name__
-        if metric_name not in self.info.columns:
-            self.info[metric_name] = None
+        metric_col = metric_to_col(metric)
+        if metric_col not in self.info.columns:
+            self.info[metric_col] = None
+        self.metric_cols.add(metric_col)
 
         X_test = pd.DataFrame(to_pandas(X_test))
         y_pred = to_pandas(y_pred)
@@ -297,7 +300,7 @@ class Explainer:
 
         # Discard the features for which the score has already been computed
         queried_features = X_test.columns.tolist()
-        to_explain = self.info["feature"][self.info[metric_name].isnull()].unique()
+        to_explain = self.info["feature"][self.info[metric_col].isnull()].unique()
         X_test = X_test[X_test.columns.intersection(to_explain)]
 
         # Compute the metric for each (feature, lambda) pair
@@ -309,12 +312,13 @@ class Explainer:
                 x=X_test[col],
                 lambdas=part["lambda"].unique(),
             )
-            for col, part in self.info.query(f"feature in {X_test.columns.tolist()}")
-                                 .groupby("feature")
+            for col, part in self.info.query(
+                f"feature in {X_test.columns.tolist()}"
+            ).groupby("feature")
         )
         scores = merge_dicts(scores)
-        self.info[metric_name] = self.info.apply(
-            lambda r: scores.get((r["feature"], r["lambda"]), r[metric_name]),
+        self.info[metric_col] = self.info.apply(
+            lambda r: scores.get((r["feature"], r["lambda"]), r[metric_col]),
             axis="columns",
         )
 
@@ -322,10 +326,12 @@ class Explainer:
 
     def rank_by_performance(self, X_test, y_test, y_pred, metric):
 
-        metric_name = metric.__name__
+        metric_col = metric_to_col(metric)
 
         def get_aggregates(df):
-            return pd.Series([df[metric_name].min(), df[metric_name].max()], index=["min", "max"])
+            return pd.Series(
+                [df[metric_col].min(), df[metric_col].max()], index=["min", "max"]
+            )
 
         return (
             self.explain_performance(X_test, y_test, y_pred, metric)
@@ -419,9 +425,7 @@ class Explainer:
         return figures
 
     @classmethod
-    def make_performance_fig(
-        cls, explanation, metric_name, with_taus=False, colors=None
-    ):
+    def make_performance_fig(cls, explanation, metric, with_taus=False, colors=None):
         """Plots metric values against variable values.
 
         If a single column is provided then the x-axis is made of the nominal
@@ -434,12 +438,13 @@ class Explainer:
         if colors is None:
             colors = {}
         features = explanation["feature"].unique()
+        metric_col = metric_to_col(metric)
 
         if with_taus:
             traces = []
             for feat in features:
                 x = explanation.query(f'feature == "{feat}"')["tau"]
-                y = explanation.query(f'feature == "{feat}"')[metric_name]
+                y = explanation.query(f'feature == "{feat}"')[metric_col]
                 traces.append(
                     go.Scatter(
                         x=x,
@@ -463,7 +468,7 @@ class Explainer:
                     margin=dict(t=50, r=50),
                     xaxis=dict(title="tau", zeroline=False),
                     yaxis=dict(
-                        title=metric_name, range=[0, 1], showline=True, tickformat="%"
+                        title=metric_col, range=[0, 1], showline=True, tickformat="%"
                     ),
                 ),
             )
@@ -471,7 +476,7 @@ class Explainer:
         figures = {}
         for feat in features:
             x = explanation.query(f'feature == "{feat}"')["value"]
-            y = explanation.query(f'feature == "{feat}"')[metric_name]
+            y = explanation.query(f'feature == "{feat}"')[metric_col]
             figures[feat] = go.Figure(
                 data=[
                     go.Scatter(
@@ -485,7 +490,7 @@ class Explainer:
                     go.Scatter(
                         x=[x.mean()],
                         y=explanation.query(f'feature == "{feat}" and tau == 0')[
-                            metric_name
+                            metric_col
                         ],
                         mode="markers",
                         name="Original mean",
@@ -497,7 +502,7 @@ class Explainer:
                     margin=dict(t=50, r=50),
                     xaxis=dict(title=f"Mean {feat}", zeroline=False),
                     yaxis=dict(
-                        title=metric_name, range=[0, 1], showline=True, tickformat="%"
+                        title=metric_col, range=[0, 1], showline=True, tickformat="%"
                     ),
                 ),
             )
@@ -536,9 +541,9 @@ class Explainer:
         return cls._make_ranking_fig(ranking, "importance", "Importance", colors=colors)
 
     @classmethod
-    def make_performance_ranking_fig(cls, ranking, metric_name, criterion, colors=None):
+    def make_performance_ranking_fig(cls, ranking, metric, criterion, colors=None):
         return cls._make_ranking_fig(
-            ranking, criterion, f"{criterion} {metric_name}", colors=colors
+            ranking, criterion, f"{criterion} {metric_to_col(metric)}", colors=colors
         )
 
     def _plot(self, explanation, make_fig, inline, **fig_kwargs):
@@ -568,9 +573,9 @@ class Explainer:
         )
         return self._plot(
             explanation,
-            functools.partial(self.make_performance_fig, metric_name=metric.__name__),
+            functools.partial(self.make_performance_fig, metric=metric),
             inline=inline,
-            **fig_kwargs
+            **fig_kwargs,
         )
 
     def plot_performance_ranking(
@@ -581,7 +586,7 @@ class Explainer:
         )
         return plot(
             self.make_performance_ranking_fig(
-                ranking, criterion=criterion, metric_name=metric.__name__, **fig_kwargs
+                ranking, criterion=criterion, metric=metric, **fig_kwargs
             ),
             inline=inline,
         )
