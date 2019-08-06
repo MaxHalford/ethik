@@ -54,9 +54,18 @@ def merge_dicts(dicts):
     return dict(collections.ChainMap(*dicts))
 
 
-def compute_lambdas(x, target_means, max_iterations=5):
+def subsample(x, sample_size, seed):
+    if sample_size == 1:
+        return x
+    sample_size = int(sample_size * len(x))
+    return np.random.RandomState(seed).choice(x, sample_size)
+
+
+def compute_lambdas(x, target_means, seed, sample_size, max_iterations=5):
     """Finds a good lambda for a variable and a given epsilon value."""
 
+    feature = x.name
+    x = subsample(x, sample_size, seed)
     mean = x.mean()
     lambdas = {}
 
@@ -79,14 +88,18 @@ def compute_lambdas(x, target_means, max_iterations=5):
             step = grad / hess
             λ -= step
 
-        lambdas[(x.name, target_mean)] = λ
+        lambdas[(feature, target_mean, seed)] = λ
 
     return lambdas
 
 
-def compute_bias(y_pred, x, lambdas):
+def compute_bias(y_pred, x, lambdas, seed, sample_size):
+    feature = x.name
+    label = y_pred.name
+    x = subsample(x, sample_size, seed)
+    y_pred = subsample(y_pred, sample_size, seed)
     return {
-        (x.name, y_pred.name, λ): np.average(y_pred, weights=np.exp(λ * x))
+        (feature, label, λ, seed): np.average(y_pred, weights=np.exp(λ * x))
         for λ in lambdas
     }
 
@@ -102,6 +115,32 @@ def metric_to_col(metric):
     # TODO: what about lambda metrics?
     # TODO: use a prefix to avoid conflicts with other columns?
     return metric.__name__
+
+
+def find_seeds(X_test, n_samples, sample_size, min_target_mean, max_target_mean):
+    if n_samples == 1:
+        yield None
+        return
+
+    n_seeds_valid = seed = 0
+    # TODO: potential infinite loop?
+    while n_seeds_valid < n_samples:
+        x = subsample(X_test, sample_size, seed)
+        if np.min(x) < min_target_mean and np.max(x) > max_target_mean:
+            n_seeds_valid += 1
+            yield seed
+        seed += 1  # TODO: generate more unpredictable seeds?
+
+
+def get_quantile_confint(series, level):
+    return np.quantile(series, level, axis=0), np.quantile(series, 1 - level, axis=0)
+
+
+def check_conf_level(level):
+    if level is None:
+        return
+    if not 0 < level < 0.5:
+        raise ValueError(f"conf_level must be between 0 and 0.5. Got {level}")
 
 
 class Explainer:
@@ -122,7 +161,14 @@ class Explainer:
     """
 
     def __init__(
-        self, alpha=0.05, n_taus=41, max_iterations=5, n_jobs=-1, verbose=False
+        self,
+        alpha=0.05,
+        n_taus=41,
+        max_iterations=5,
+        n_jobs=-1,
+        verbose=False,
+        n_samples=1,
+        sample_size=0.8,
     ):
         if not 0 < alpha < 0.5:
             raise ValueError("alpha must be between 0 and 0.5, got " f"{alpha}")
@@ -138,6 +184,12 @@ class Explainer:
                 f"integer, got {max_iterations}"
             )
 
+        if n_samples < 1:
+            raise ValueError(f"n_samples must be strictly positive, got {n_samples}")
+
+        if not 0 < sample_size < 1:
+            raise ValueError(f"sample_size must be between 0 and 1, got {sample_size}")
+
         #  TODO: one column per performance metric
         self.alpha = alpha
         self.n_taus = n_taus
@@ -145,8 +197,10 @@ class Explainer:
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.metric_cols = set()
+        self.n_samples = n_samples
+        self.sample_size = sample_size if n_samples > 1 else 1
         self.info = pd.DataFrame(
-            columns=["feature", "tau", "value", "lambda", "label", "bias"]
+            columns=["seed", "feature", "tau", "value", "lambda", "label", "bias"]
         )
 
     @property
@@ -178,7 +232,7 @@ class Explainer:
 
         X_test = X_test[X_test.columns.difference(self.features)]
         if X_test.empty:
-            return self
+            return self.info
 
         # Make the epsilons
         q_mins = X_test.quantile(q=self.alpha).to_dict()
@@ -202,10 +256,18 @@ class Explainer:
                         ],
                         "feature": col,
                         "label": y,
+                        "seed": seed,
                     }
                 )
                 for col in X_test_num.columns
                 for y in y_pred.columns
+                for seed in find_seeds(
+                    X_test_num[col],
+                    self.n_samples,
+                    self.sample_size,
+                    q_mins[col],
+                    q_maxs[col],
+                )
             ],
             ignore_index=True,
         )
@@ -216,14 +278,17 @@ class Explainer:
             joblib.delayed(compute_lambdas)(
                 x=X_test[col],
                 target_means=part["value"].unique(),
+                seed=seed,
+                sample_size=self.sample_size,
                 max_iterations=self.max_iterations,
             )
             for col, part in self.info.groupby("feature")
+            for seed in part["seed"]
             if col in X_test
         )
         lambdas = merge_dicts(lambdas)
         self.info["lambda"] = self.info.apply(
-            lambda r: lambdas.get((r["feature"], r["value"]), r["lambda"]),
+            lambda r: lambdas.get((r["feature"], r["value"], r["seed"]), r["lambda"]),
             axis="columns",
         )
 
@@ -249,14 +314,20 @@ class Explainer:
         # Compute the average predictions for each (column, tau) pair per label
         biases = joblib.Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
             joblib.delayed(compute_bias)(
-                y_pred=y_pred[label], x=X_test[col], lambdas=part["lambda"].unique()
+                y_pred=y_pred[label],
+                x=X_test[feat],
+                lambdas=part["lambda"].unique(),
+                seed=seed,
+                sample_size=self.sample_size,
             )
             for label in y_pred.columns
-            for col, part in relevant.groupby("feature")
+            for (feat, seed), part in relevant.groupby(["feature", "seed"])
         )
         biases = merge_dicts(biases)
         self.info["bias"] = self.info.apply(
-            lambda r: biases.get((r["feature"], r["label"], r["lambda"]), r["bias"]),
+            lambda r: biases.get(
+                (r["feature"], r["label"], r["lambda"], r["seed"]), r["bias"]
+            ),
             axis="columns",
         )
         return self.info.query(f"feature in {queried_features}")
@@ -341,7 +412,7 @@ class Explainer:
         )
 
     @classmethod
-    def make_bias_fig(cls, explanation, with_taus=False, colors=None):
+    def make_bias_fig(cls, explanation, with_taus=False, colors=None, conf_level=None):
         """Plots predicted means against variables values.
 
         If a single column is provided then the x-axis is made of the nominal
@@ -351,6 +422,7 @@ class Explainer:
 
         """
 
+        check_conf_level(conf_level)
         if colors is None:
             colors = {}
         features = explanation["feature"].unique()
@@ -358,11 +430,11 @@ class Explainer:
         y_label = f"Proportion of {labels[0]}"  #  Single class
 
         if with_taus:
-            traces = []
+            fig = go.Figure()
             for feat in features:
                 x = explanation.query(f'feature == "{feat}"')["tau"]
                 y = explanation.query(f'feature == "{feat}"')["bias"]
-                traces.append(
+                fig.add_trace(
                     go.Scatter(
                         x=x,
                         y=y,
@@ -378,50 +450,51 @@ class Explainer:
                         marker=dict(color=colors.get(feat)),
                     )
                 )
-
-            return go.Figure(
-                data=traces,
-                layout=go.Layout(
-                    margin=dict(t=50, r=50),
-                    xaxis=dict(title="tau", zeroline=False),
-                    yaxis=dict(
-                        title=y_label, range=[0, 1], showline=True, tickformat="%"
-                    ),
-                ),
+            fig.update_layout(
+                margin=dict(t=50, r=50),
+                xaxis=dict(title="tau", zeroline=False),
+                yaxis=dict(title=y_label, range=[0, 1], showline=True, tickformat="%"),
+                plot_bgcolor="white",
             )
+            return fig
 
         figures = {}
         for feat in features:
-            x = explanation.query(f'feature == "{feat}"')["value"]
-            y = explanation.query(f'feature == "{feat}"')["bias"]
-            mean_row = explanation.query(f'feature == "{feat}" and tau == 0').iloc[0]
-            figures[feat] = go.Figure(
-                data=[
+            fig = go.Figure()
+            x = explanation.query(f'feature == "{feat}"')["value"].unique()
+            ys = [
+                part["bias"].values
+                for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
+            ]
+            if conf_level is not None:
+                low, high = get_quantile_confint(ys, conf_level)
+                fig.add_trace(
                     go.Scatter(
-                        x=x,
-                        y=y,
-                        mode="lines+markers",
-                        hoverinfo="x+y",
-                        showlegend=False,
-                        marker=dict(color=colors.get(feat)),
-                    ),
-                    go.Scatter(
-                        x=[mean_row["value"]],
-                        y=[mean_row["bias"]],
-                        mode="markers",
-                        name="Original mean",
-                        hoverinfo="skip",
-                        marker=dict(symbol="x", size=9),
-                    ),
-                ],
-                layout=go.Layout(
-                    margin=dict(t=50, r=50),
-                    xaxis=dict(title=f"Mean {feat}", zeroline=False),
-                    yaxis=dict(
-                        title=y_label, range=[0, 1], showline=True, tickformat="%"
-                    ),
-                ),
+                        x=np.concatenate((x, x[::-1])),
+                        y=np.concatenate((low, high[::-1])),
+                        name=f"{conf_level * 100}% quantiles",
+                        fill="toself",
+                        fillcolor="#eee",  # TODO: same color as mean line?
+                        line_color="rgba(0, 0, 0, 0)",
+                    )
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=np.mean(ys, axis=0),
+                    name="Mean",
+                    mode="lines+markers",
+                    hoverinfo="x+y",
+                    marker=dict(color=colors.get(feat)),
+                )
             )
+            fig.update_layout(
+                margin=dict(t=50, r=50),
+                xaxis=dict(title=f"Mean {feat}", zeroline=False),
+                yaxis=dict(title=y_label, range=[0, 1], showline=True, tickformat="%"),
+                plot_bgcolor="white",
+            )
+            figures[feat] = fig
         return figures
 
     @classmethod
