@@ -104,9 +104,13 @@ def compute_bias(y_pred, x, lambdas, seed, sample_size):
     }
 
 
-def compute_performance(y_test, y_pred, metric, x, lambdas):
+def compute_performance(y_test, y_pred, metric, x, lambdas, seed, sample_size):
+    feature = x.name
+    x = subsample(x, sample_size, seed)
+    y_pred = subsample(y_pred, sample_size, seed)
+    y_test = subsample(y_test, sample_size, seed)
     return {
-        (x.name, λ): metric(y_test, y_pred, sample_weight=np.exp(λ * x))
+        (feature, λ, seed): metric(y_test, y_pred, sample_weight=np.exp(λ * x))
         for λ in lambdas
     }
 
@@ -359,6 +363,9 @@ class Explainer:
                 metrics from scikit-learn will work.
 
         """
+        if len(y_test) != len(y_pred):
+            raise ValueError("y_test and y_pred must be of the same length")
+
         metric_col = metric_to_col(metric)
         if metric_col not in self.info.columns:
             self.info[metric_col] = None
@@ -373,6 +380,7 @@ class Explainer:
         queried_features = X_test.columns.tolist()
         to_explain = self.info["feature"][self.info[metric_col].isnull()].unique()
         X_test = X_test[X_test.columns.intersection(to_explain)]
+        relevant = self.info.query(f"feature in {X_test.columns.tolist()}")
 
         # Compute the metric for each (feature, lambda) pair
         scores = joblib.Parallel(n_jobs=self.n_jobs, verbose=self.verbose)(
@@ -380,16 +388,16 @@ class Explainer:
                 y_test=y_test,
                 y_pred=y_pred,
                 metric=metric,
-                x=X_test[col],
+                x=X_test[feat],
                 lambdas=part["lambda"].unique(),
+                seed=seed,
+                sample_size=self.sample_size,
             )
-            for col, part in self.info.query(
-                f"feature in {X_test.columns.tolist()}"
-            ).groupby("feature")
+            for (feat, seed), part in relevant.groupby(["feature", "seed"])
         )
         scores = merge_dicts(scores)
         self.info[metric_col] = self.info.apply(
-            lambda r: scores.get((r["feature"], r["lambda"]), r[metric_col]),
+            lambda r: scores.get((r["feature"], r["lambda"], r["seed"]), r[metric_col]),
             axis="columns",
         )
 
@@ -498,7 +506,9 @@ class Explainer:
         return figures
 
     @classmethod
-    def make_performance_fig(cls, explanation, metric, with_taus=False, colors=None):
+    def make_performance_fig(
+        cls, explanation, metric, with_taus=False, colors=None, conf_level=None
+    ):
         """Plots metric values against variable values.
 
         If a single column is provided then the x-axis is made of the nominal
@@ -508,17 +518,18 @@ class Explainer:
 
         """
 
+        check_conf_level(conf_level)
         if colors is None:
             colors = {}
         features = explanation["feature"].unique()
         metric_col = metric_to_col(metric)
 
         if with_taus:
-            traces = []
+            fig = go.Figure()
             for feat in features:
                 x = explanation.query(f'feature == "{feat}"')["tau"]
                 y = explanation.query(f'feature == "{feat}"')[metric_col]
-                traces.append(
+                fig.add_trace(
                     go.Scatter(
                         x=x,
                         y=y,
@@ -535,50 +546,55 @@ class Explainer:
                     )
                 )
 
-            return go.Figure(
-                data=traces,
-                layout=go.Layout(
-                    margin=dict(t=50, r=50),
-                    xaxis=dict(title="tau", zeroline=False),
-                    yaxis=dict(
-                        title=metric_col, range=[0, 1], showline=True, tickformat="%"
-                    ),
+            fig.update_layout(
+                margin=dict(t=50, r=50),
+                xaxis=dict(title="tau", zeroline=False),
+                yaxis=dict(
+                    title=metric_col, range=[0, 1], showline=True, tickformat="%"
                 ),
+                plot_bgcolor="white",
             )
+            return fig
 
         figures = {}
         for feat in features:
-            x = explanation.query(f'feature == "{feat}"')["value"]
-            y = explanation.query(f'feature == "{feat}"')[metric_col]
-            figures[feat] = go.Figure(
-                data=[
+            fig = go.Figure()
+            x = explanation.query(f'feature == "{feat}"')["value"].unique()
+            ys = [
+                part[metric_col].values
+                for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
+            ]
+            if conf_level is not None:
+                low, high = get_quantile_confint(ys, conf_level)
+                fig.add_trace(
                     go.Scatter(
-                        x=x,
-                        y=y,
-                        mode="lines+markers",
-                        hoverinfo="x+y",
-                        showlegend=False,
-                        marker=dict(color=colors.get(feat)),
-                    ),
-                    go.Scatter(
-                        x=[x.mean()],
-                        y=explanation.query(f'feature == "{feat}" and tau == 0')[
-                            metric_col
-                        ],
-                        mode="markers",
-                        name="Original mean",
-                        hoverinfo="skip",
-                        marker=dict(symbol="x", size=9),
-                    ),
-                ],
-                layout=go.Layout(
-                    margin=dict(t=50, r=50),
-                    xaxis=dict(title=f"Mean {feat}", zeroline=False),
-                    yaxis=dict(
-                        title=metric_col, range=[0, 1], showline=True, tickformat="%"
-                    ),
-                ),
+                        x=np.concatenate((x, x[::-1])),
+                        y=np.concatenate((low, high[::-1])),
+                        name=f"{conf_level * 100}% quantiles",
+                        fill="toself",
+                        fillcolor="#eee",  # TODO: same color as mean line?
+                        line_color="rgba(0, 0, 0, 0)",
+                    )
+                )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=np.mean(ys, axis=0),
+                    name="Mean",
+                    mode="lines+markers",
+                    hoverinfo="x+y",
+                    marker=dict(color=colors.get(feat)),
+                )
             )
+            fig.update_layout(
+                margin=dict(t=50, r=50),
+                xaxis=dict(title=f"Mean {feat}", zeroline=False),
+                yaxis=dict(
+                    title=metric_col, range=[0, 1], showline=True, tickformat="%"
+                ),
+                plot_bgcolor="white",
+            )
+            figures[feat] = fig
         return figures
 
     @classmethod
