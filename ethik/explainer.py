@@ -123,7 +123,7 @@ def metric_to_col(metric):
 
 def find_seeds(X_test, n_samples, sample_size, min_target_mean, max_target_mean):
     if n_samples == 1:
-        yield None
+        yield 0  # Cannot use None or NaN as pandas.groupby() would skip them
         return
 
     n_seeds_valid = seed = 0
@@ -136,8 +136,11 @@ def find_seeds(X_test, n_samples, sample_size, min_target_mean, max_target_mean)
         seed += 1  # TODO: generate more unpredictable seeds?
 
 
-def get_quantile_confint(series, level):
-    return np.quantile(series, level, axis=0), np.quantile(series, 1 - level, axis=0)
+def get_quantile_confint(series, level, axis=None):
+    return (
+        np.quantile(series, level, axis=axis),
+        np.quantile(series, 1 - level, axis=axis),
+    )
 
 
 def check_conf_level(level):
@@ -348,7 +351,7 @@ class Explainer:
 
         return (
             self.explain_bias(X_test=X_test, y_pred=y_pred)
-            .groupby(["label", "feature"])
+            .groupby(["label", "feature", "seed"])
             .apply(get_importance)
             .to_frame("importance")
             .reset_index()
@@ -414,7 +417,7 @@ class Explainer:
 
         return (
             self.explain_performance(X_test, y_test, y_pred, metric)
-            .groupby("feature")
+            .groupby(["feature", "seed"])
             .apply(get_aggregates)
             .reset_index()
         )
@@ -440,8 +443,8 @@ class Explainer:
         if with_taus:
             fig = go.Figure()
             for feat in features:
-                x = explanation.query(f'feature == "{feat}"')["tau"]
-                y = explanation.query(f'feature == "{feat}"')["bias"]
+                x = explanation.query(f"feature == '{feat}'")["tau"]
+                y = explanation.query(f"feature == '{feat}'")["bias"]
                 fig.add_trace(
                     go.Scatter(
                         x=x,
@@ -475,7 +478,7 @@ class Explainer:
                 for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
             ]
             if conf_level is not None:
-                low, high = get_quantile_confint(ys, conf_level)
+                low, high = get_quantile_confint(ys, conf_level, axis=0)
                 fig.add_trace(
                     go.Scatter(
                         x=np.concatenate((x, x[::-1])),
@@ -565,7 +568,7 @@ class Explainer:
                 for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
             ]
             if conf_level is not None:
-                low, high = get_quantile_confint(ys, conf_level)
+                low, high = get_quantile_confint(ys, conf_level, axis=0)
                 fig.add_trace(
                     go.Scatter(
                         x=np.concatenate((x, x[::-1])),
@@ -598,41 +601,61 @@ class Explainer:
         return figures
 
     @classmethod
-    def _make_ranking_fig(cls, ranking, score_column, title, colors=None):
-        ranking = ranking.sort_values(by=[score_column])
+    def _make_ranking_fig(
+        cls, ranking, score_column, title, colors=None, conf_level=None
+    ):
+        sorted_means = ranking.groupby("feature").mean().sort_values(by=[score_column])
+        sorted_features = sorted_means.index
+        low_errors = []
+        high_errors = []
 
-        return go.Figure(
-            data=[
-                go.Bar(
-                    x=ranking[score_column],
-                    y=ranking["feature"],
-                    orientation="h",
-                    hoverinfo="x",
-                    marker=dict(color=colors),
-                )
-            ],
-            layout=go.Layout(
-                margin=dict(l=200, b=0, t=40),
-                xaxis=dict(
-                    title=title,
-                    range=[0, 1],
-                    showline=True,
-                    zeroline=False,
-                    side="top",
-                    fixedrange=True,
+        if conf_level is not None:
+            for i, feat in enumerate(sorted_features):
+                scores = ranking.query(f"feature == '{feat}'")[score_column]
+                low, high = get_quantile_confint(scores, conf_level)
+                mean = sorted_means[score_column][feat]
+                low_errors.append(mean - low)
+                high_errors.append(high - mean)
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=sorted_means[score_column],
+                y=sorted_features,
+                orientation="h",
+                hoverinfo="x",
+                marker=dict(color=colors),
+                error_x=dict(
+                    type="data",
+                    symmetric=False,
+                    array=high_errors,
+                    arrayminus=low_errors,
                 ),
-                yaxis=dict(showline=True, zeroline=False, fixedrange=True),
-            ),
+            )
         )
+        fig.update_layout(
+            margin=dict(l=200, b=0, t=40),
+            xaxis=dict(
+                title=title,
+                range=[0, 1],
+                showline=True,
+                zeroline=False,
+                side="top",
+                fixedrange=True,
+            ),
+            yaxis=dict(showline=True, zeroline=False, fixedrange=True),
+            plot_bgcolor="white",
+        )
+        return fig
 
     @classmethod
-    def make_bias_ranking_fig(cls, ranking, colors=None):
-        return cls._make_ranking_fig(ranking, "importance", "Importance", colors=colors)
+    def make_bias_ranking_fig(cls, ranking, **kwargs):
+        return cls._make_ranking_fig(ranking, "importance", "Importance", **kwargs)
 
     @classmethod
-    def make_performance_ranking_fig(cls, ranking, metric, criterion, colors=None):
+    def make_performance_ranking_fig(cls, ranking, metric, criterion, **kwargs):
         return cls._make_ranking_fig(
-            ranking, criterion, f"{criterion} {metric_to_col(metric)}", colors=colors
+            ranking, criterion, f"{criterion} {metric_to_col(metric)}", **kwargs
         )
 
     def _plot(self, explanation, make_fig, inline, **fig_kwargs):
