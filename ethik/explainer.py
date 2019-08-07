@@ -407,7 +407,6 @@ class Explainer:
         return self.info.query(f"feature in {queried_features}")
 
     def rank_by_performance(self, X_test, y_test, y_pred, metric):
-
         metric_col = metric_to_col(metric)
 
         def get_aggregates(df):
@@ -423,32 +422,28 @@ class Explainer:
         )
 
     @classmethod
-    def make_bias_fig(cls, explanation, with_taus=False, colors=None, conf_level=None):
-        """Plots predicted means against variables values.
-
-        If a single column is provided then the x-axis is made of the nominal
-        values from that column. However if a list of columns is passed then
-        the x-axis contains the tau values. This method makes use of the
-        `explain_predictions` method.
-
-        """
-
+    def _make_explanation_fig(
+        cls, explanation, y_col, y_label, with_taus=False, colors=None, conf_level=None
+    ):
         check_conf_level(conf_level)
         if colors is None:
             colors = {}
         features = explanation["feature"].unique()
-        labels = explanation["label"].unique()
-        y_label = f"Proportion of {labels[0]}"  #  Single class
 
         if with_taus:
             fig = go.Figure()
             for feat in features:
-                x = explanation.query(f"feature == '{feat}'")["tau"]
-                y = explanation.query(f"feature == '{feat}'")["bias"]
+                x = explanation.query(f"feature == '{feat}'")["tau"].unique()
+                ys = [
+                    part[y_col].values
+                    for _, part in explanation.query(f'feature == "{feat}"').groupby(
+                        "seed"
+                    )
+                ]
                 fig.add_trace(
                     go.Scatter(
                         x=x,
-                        y=y,
+                        y=np.mean(ys, axis=0),
                         mode="lines+markers",
                         hoverinfo="x+y+text",
                         name=feat,
@@ -474,7 +469,7 @@ class Explainer:
             fig = go.Figure()
             x = explanation.query(f'feature == "{feat}"')["value"].unique()
             ys = [
-                part["bias"].values
+                part[y_col].values
                 for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
             ]
             if conf_level is not None:
@@ -509,96 +504,19 @@ class Explainer:
         return figures
 
     @classmethod
-    def make_performance_fig(
-        cls, explanation, metric, with_taus=False, colors=None, conf_level=None
-    ):
-        """Plots metric values against variable values.
+    def make_bias_fig(cls, explanation, **kwargs):
+        labels = explanation["label"].unique()
+        y_label = f"Proportion of {labels[0]}"  #  Single class
+        return cls._make_explanation_fig(
+            explanation, y_col="bias", y_label=y_label, **kwargs
+        )
 
-        If a single column is provided then the x-axis is made of the nominal
-        values from that column. However if a list of columns is passed then
-        the x-axis contains the tau values. This method makes use of the
-        `explain_metric` method.
-
-        """
-
-        check_conf_level(conf_level)
-        if colors is None:
-            colors = {}
-        features = explanation["feature"].unique()
+    @classmethod
+    def make_performance_fig(cls, explanation, metric, **kwargs):
         metric_col = metric_to_col(metric)
-
-        if with_taus:
-            fig = go.Figure()
-            for feat in features:
-                x = explanation.query(f'feature == "{feat}"')["tau"]
-                y = explanation.query(f'feature == "{feat}"')[metric_col]
-                fig.add_trace(
-                    go.Scatter(
-                        x=x,
-                        y=y,
-                        mode="lines+markers",
-                        hoverinfo="x+y+text",
-                        name=feat,
-                        text=[
-                            f"{feat} = {val}"
-                            for val in explanation.query(f'feature == "{feat}"')[
-                                "value"
-                            ]
-                        ],
-                        marker=dict(color=colors.get(feat)),
-                    )
-                )
-
-            fig.update_layout(
-                margin=dict(t=50, r=50),
-                xaxis=dict(title="tau", zeroline=False),
-                yaxis=dict(
-                    title=metric_col, range=[0, 1], showline=True, tickformat="%"
-                ),
-                plot_bgcolor="white",
-            )
-            return fig
-
-        figures = {}
-        for feat in features:
-            fig = go.Figure()
-            x = explanation.query(f'feature == "{feat}"')["value"].unique()
-            ys = [
-                part[metric_col].values
-                for _, part in explanation.query(f'feature == "{feat}"').groupby("seed")
-            ]
-            if conf_level is not None:
-                low, high = get_quantile_confint(ys, conf_level, axis=0)
-                fig.add_trace(
-                    go.Scatter(
-                        x=np.concatenate((x, x[::-1])),
-                        y=np.concatenate((low, high[::-1])),
-                        name=f"{conf_level * 100}% quantiles",
-                        fill="toself",
-                        fillcolor="#eee",  # TODO: same color as mean line?
-                        line_color="rgba(0, 0, 0, 0)",
-                    )
-                )
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=np.mean(ys, axis=0),
-                    name="Mean",
-                    mode="lines+markers",
-                    hoverinfo="x+y",
-                    marker=dict(color=colors.get(feat)),
-                )
-            )
-            fig.update_layout(
-                margin=dict(t=50, r=50),
-                xaxis=dict(title=f"Mean {feat}", zeroline=False),
-                yaxis=dict(
-                    title=metric_col, range=[0, 1], showline=True, tickformat="%"
-                ),
-                plot_bgcolor="white",
-            )
-            figures[feat] = fig
-        return figures
+        return cls._make_explanation_fig(
+            explanation, y_col=metric_col, y_label=metric_col, **kwargs
+        )
 
     @classmethod
     def _make_ranking_fig(
