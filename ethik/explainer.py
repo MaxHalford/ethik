@@ -54,11 +54,11 @@ def merge_dicts(dicts):
     return dict(collections.ChainMap(*dicts))
 
 
-def subsample(x, sample_size, seed):
+def subsample(x, sample_size, seed, replace=False):
     if sample_size == 1:
         return x
     sample_size = int(sample_size * len(x))
-    return np.random.RandomState(seed).choice(x, sample_size)
+    return np.random.RandomState(seed).choice(x, sample_size, replace=replace)
 
 
 def compute_lambdas(x, target_means, seed, sample_size, max_iterations=5):
