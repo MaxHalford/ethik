@@ -50,6 +50,7 @@ pre-commit install # For black
 * [Regression (Boston dataset)](notebooks/Regression.html)
 * [Images (MNIST dataset)](notebooks/Image.html)
 * [Comparison with Partial Dependence Plots](notebooks/Partial Dependence Plot.html)
+* [Case study: Diabetes](notebooks/Diabetes.html)
 
 # API
 
