@@ -420,7 +420,49 @@ class Explainer:
             & self.info["label"].isin(y_pred.columns)
         ]
 
-    def explain_influence(self, X_test, y_pred):
+    def _explain_individual(self, X_test, y_pred, individual, dest_col, compute):
+        X_test = pd.DataFrame(to_pandas(X_test))
+        y_pred = pd.DataFrame(to_pandas(y_pred))
+        individual = to_pandas(individual)  #  individual is a pd.Series now
+
+        # One-hot encode the categorical variables
+        X_test = pd.get_dummies(data=X_test, prefix_sep=CAT_COL_SEP)
+        individual = pd.get_dummies(
+            data=pd.DataFrame(  #  A DataFrame is needed for get_dummies
+                [individual.values], columns=individual.index
+            ),
+            prefix_sep=CAT_COL_SEP,
+        ).iloc[0]
+
+        explanation = collections.defaultdict(list)
+
+        for feature in X_test:
+            if feature not in individual:
+                continue
+
+            ksi = compute_ksis(
+                x=X_test[feature],
+                target_means=[individual[feature]],
+                max_iterations=self.max_iterations,
+                tol=self.tol,
+            )
+            ksi = list(ksi.values())[0]
+
+            mean_explanation = compute(X_test, y_pred, feature, 0)
+            individual_explanation = compute(X_test, y_pred, feature, ksi)
+
+            for mean_entry, individual_entry in zip(
+                mean_explanation, individual_explanation
+            ):
+                individual_entry["delta_to_mean"] = (
+                    individual_entry[dest_col] - mean_entry[dest_col]
+                )
+                for k, v in individual_entry.items():
+                    explanation[k].append(v)
+
+        return pd.DataFrame(explanation)
+
+    def explain_influence(self, X_test, y_pred, individual=None):
         """Compute the influence of the model for the features in `X_test`.
 
         Args:
@@ -486,6 +528,15 @@ class Explainer:
             >>> explainer.explain_influence(X_test, y_pred)
         """
 
+        def compute_individual(X_test, y_pred, feature, label, ksi, mask=None):
+            if mask is None:
+                mask = np.full(shape=len(X_test), fill_value=True)
+
+            return np.average(
+                y_pred[label][mask],
+                weights=special.softmax(ksi * X_test[feature][mask]),
+            )
+
         def compute(X_test, y_pred, relevant):
             keys = relevant.groupby(["feature", "label", "ksi"]).groups.keys()
             return pd.DataFrame(
@@ -495,9 +546,8 @@ class Explainer:
                         label,
                         ksi,
                         sample_index,
-                        np.average(
-                            y_pred[label][mask],
-                            weights=special.softmax(ksi * X_test[feature][mask]),
+                        compute_individual(
+                            X_test, y_pred, feature, label, ksi, mask=mask
                         ),
                     )
                     for (sample_index, mask), (feature, label, ksi) in tqdm(
@@ -518,6 +568,24 @@ class Explainer:
                 columns=["feature", "label", "ksi", "sample_index", "influence"],
             )
 
+        if individual is not None:
+            return self._explain_individual(
+                X_test=X_test,
+                y_pred=y_pred,
+                individual=individual,
+                dest_col="influence",
+                compute=lambda X_test, y_pred, feature, ksi: [
+                    dict(
+                        label=label,
+                        feature=feature,
+                        influence=compute_individual(
+                            X_test, y_pred, feature, label, ksi
+                        ),
+                    )
+                    for label in y_pred.columns
+                ],
+            )
+
         return self._explain(
             X_test=X_test,
             y_pred=y_pred,
@@ -526,7 +594,7 @@ class Explainer:
             compute=compute,
         )
 
-    def explain_performance(self, X_test, y_test, y_pred, metric):
+    def explain_performance(self, X_test, y_test, y_pred, metric, individual=None):
         """Compute the change in model's performance for the features in `X_test`.
 
         Args:
@@ -566,6 +634,16 @@ class Explainer:
 
         y_test = np.asarray(y_test)
 
+        def compute_individual(X_test, y_pred, feature, ksi, mask=None):
+            if mask is None:
+                mask = np.full(shape=len(X_test), fill_value=True)
+
+            return metric(
+                y_test[mask],
+                y_pred[mask],
+                sample_weight=special.softmax(ksi * X_test[feature][mask]),
+            )
+
         def compute(X_test, y_pred, relevant):
             keys = relevant.groupby(["feature", "ksi"]).groups.keys()
             return pd.DataFrame(
@@ -574,11 +652,7 @@ class Explainer:
                         feature,
                         ksi,
                         sample_index,
-                        metric(
-                            y_test[mask],
-                            y_pred[mask],
-                            sample_weight=special.softmax(ksi * X_test[feature][mask]),
-                        ),
+                        compute_individual(X_test, y_pred, feature, ksi, mask=mask),
                     )
                     for (sample_index, mask), (feature, ksi) in tqdm(
                         itertools.product(
@@ -596,6 +670,20 @@ class Explainer:
                     )
                 ],
                 columns=["feature", "ksi", "sample_index", metric_name],
+            )
+
+        if individual is not None:
+            return self._explain_individual(
+                X_test=X_test,
+                y_pred=y_pred,
+                individual=individual,
+                dest_col=metric_name,
+                compute=lambda X_test, y_pred, feature, ksi: [
+                    {
+                        "feature": feature,
+                        metric_name: compute_individual(X_test, y_pred, feature, ksi),
+                    }
+                ],
             )
 
         return self._explain(
@@ -845,12 +933,80 @@ class Explainer:
         )
         return fig
 
-    def _plot_ranking(self, ranking, score_column, title, n_features=None, colors=None):
+    def _plot_individual_explanation(
+        self, explanation, title, colors=None, size=None, yrange=None
+    ):
+        explanation = explanation.sort_values(by=["delta_to_mean"], ascending=True)
+        features = explanation["feature"]
+
+        if colors is None:
+            colors = {}
+        elif type(colors) is str:
+            colors = {feat: colors for feat in features}
+
+        width = 500
+        height = 100 + 60 * len(features)
+        if size is not None:
+            width, height = size
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Bar(
+                x=explanation["delta_to_mean"],
+                y=features,
+                orientation="h",
+                hoverinfo="x",
+            )
+        )
+        fig.update_layout(
+            xaxis=dict(
+                title=f"Difference in {title} with original dataset",
+                range=yrange,
+                showline=True,
+                linewidth=1,
+                linecolor="black",
+                zeroline=False,
+                gridcolor="#eee",
+                side="top",
+                fixedrange=True,
+            ),
+            yaxis=dict(
+                showline=False,
+                zeroline=False,
+                fixedrange=True,
+                linecolor="black",
+                automargin=True,
+            ),
+            shapes=[
+                go.layout.Shape(
+                    type="line",
+                    x0=0,
+                    y0=0,
+                    x1=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(color="black", width=1),
+                )
+            ],
+            plot_bgcolor="white",
+            width=width,
+            height=height,
+        )
+        return fig
+
+    def _plot_ranking(
+        self, ranking, score_column, title, n_features=None, colors=None, size=None
+    ):
         if n_features is None:
             n_features = len(ranking)
         ascending = n_features >= 0
         ranking = ranking.sort_values(by=[score_column], ascending=ascending)
         n_features = abs(n_features)
+
+        width = 500
+        height = 50 * n_features
+        if size is not None:
+            width, height = size
 
         return go.Figure(
             data=[
@@ -864,28 +1020,34 @@ class Explainer:
             ],
             layout=go.Layout(
                 margin=dict(b=0, t=40),
+                width=width,
+                height=height,
                 xaxis=dict(
                     title=title,
                     range=[0, 1],
                     showline=True,
-                    zeroline=False,
                     linecolor="black",
+                    linewidth=1,
+                    zeroline=False,
                     gridcolor="#eee",
                     side="top",
                     fixedrange=True,
                 ),
                 yaxis=dict(
                     showline=True,
+                    linecolor="black",
+                    linewidth=1,
                     zeroline=False,
                     fixedrange=True,
-                    linecolor="black",
                     automargin=True,
                 ),
                 plot_bgcolor="white",
             ),
         )
 
-    def plot_influence(self, X_test, y_pred, colors=None, yrange=None, size=None):
+    def plot_influence(
+        self, X_test, y_pred, individual=None, colors=None, yrange=None, size=None
+    ):
         """Plot the influence of the model for the features in `X_test`.
 
         Args:
@@ -910,10 +1072,16 @@ class Explainer:
             ... ))
             >>> explainer.plot_influence(X_test, y_pred, yrange=[0.5, 1])
         """
-        explanation = self.explain_influence(X_test, y_pred)
+        explanation = self.explain_influence(X_test, y_pred, individual=individual)
         labels = explanation["label"].unique()
         if len(labels) > 1:
             raise ValueError("Cannot plot multiple labels")
+
+        if individual is not None:
+            return self._plot_individual_explanation(
+                explanation, title="influence", colors=colors, size=size, yrange=yrange
+            )
+
         y_label = f"Average '{labels[0]}'"
         return self._plot_explanation(
             explanation, "influence", y_label, colors=colors, yrange=yrange, size=size
@@ -947,7 +1115,15 @@ class Explainer:
         )
 
     def plot_performance(
-        self, X_test, y_test, y_pred, metric, colors=None, yrange=None, size=None
+        self,
+        X_test,
+        y_test,
+        y_pred,
+        metric,
+        individual=None,
+        colors=None,
+        yrange=None,
+        size=None,
     ):
         """Plot the performance of the model for the features in `X_test`.
 
@@ -967,11 +1143,20 @@ class Explainer:
         """
         metric_name = self.get_metric_name(metric)
         explanation = self.explain_performance(
-            X_test=X_test, y_test=y_test, y_pred=y_pred, metric=metric
+            X_test=X_test,
+            y_test=y_test,
+            y_pred=y_pred,
+            metric=metric,
+            individual=individual,
         )
         if yrange is None:
             if explanation[metric_name].between(0, 1).all():
-                yrange = [0, 1]
+                yrange = [0, 1] if individual is None else [-1, 1]
+
+        if individual is not None:
+            return self._plot_individual_explanation(
+                explanation, title=metric_name, colors=colors, size=size, yrange=yrange
+            )
 
         return self._plot_explanation(
             explanation,

@@ -7,6 +7,7 @@
 * Added the Pima indians diabetes dataset via the `datasets.load_diabetes` function.
 * Added the UCI heart disease dataset via the `datasets.load_heart_disease` function.
 * A `ConstantWarning` will now be raised when a feature has only one single value.
+* Added a parameter `individual` to `explain_*` methods to visualize how the model behaves on average for a given individual.
 
 ### Changed
 
