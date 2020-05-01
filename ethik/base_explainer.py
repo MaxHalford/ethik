@@ -45,27 +45,33 @@ class F:
 
     """
 
-    def __init__(self, x, target_mean, tol):
+    def __init__(self, x, target_mean):
         self.x = x
         self.target_mean = target_mean
-        self.tol = tol
 
     def __call__(self, ksi):
-        """Returns the loss and the gradient for a particular ksi value."""
+        """Returns the loss and the gradient for a particular ksi value.
+        
+        See the paper: https://arxiv.org/abs/1810.07924
+        """
 
+        n = len(self.x)
         if len(ksi) == 1:
-            lambdas = special.softmax(self.x * ksi[0])
-            current_mean = np.average(self.x, weights=lambdas, axis=0)[0]
-            loss = (current_mean - self.target_mean[0]) ** 2
+            t = self.target_mean[0]
+            x = self.x[:, 0]
+            e = np.exp(ksi[0] * x)
+            s = np.sum(e)
+            loss = np.log(s / n) - ksi[0] * t
+            g = np.array([np.sum(x * e) / s - t])
         else:
-            lambdas = special.softmax(np.dot(self.x, ksi))
-            current_mean = np.average(self.x, weights=lambdas, axis=0)
-            loss = np.linalg.norm(current_mean - self.target_mean)
-
-        if loss < self.tol:
-            raise ConvergenceSuccess(ksi=ksi)
-
-        g = current_mean - self.target_mean
+            t = self.target_mean
+            x = self.x
+            e = np.exp(np.dot(x, ksi))  # Vector of length n
+            s = np.sum(e)  # Scalar
+            loss = np.log(1 / n * s) - np.dot(ksi, t)  # Scalar
+            # Element-wise multiply the rows of x by the elements of e
+            m = x * e.reshape(-1, 1)  # n * 2 matrix
+            g = np.sum(m, axis=0) / s - t
 
         return loss, g
 
@@ -96,25 +102,21 @@ def compute_ksi(group_id, x, target_mean, max_iterations, tol):
     mean, std = x.mean().values, x.std().values
     features = x.columns
     x = safe_scale(x).values
-    ksis = np.zeros(len(target_mean))
 
     if np.isclose(target_mean, mean, atol=tol).all():
         return {(group_id, feature): (0.0, True) for feature in features}
 
-    converged = False
-    try:
-        res = optimize.minimize(
-            fun=F(x=x, target_mean=(target_mean - mean) / std, tol=tol),
-            x0=ksis,  # Initial ksi value
-            jac=True,
-            method="BFGS",
-        )
-    except ConvergenceSuccess as cs:
-        ksis = cs.ksi
-        converged = True
+    res = optimize.minimize(
+        fun=F(x=x, target_mean=(target_mean - mean) / np.where(std == 0, 1, std)),
+        x0=np.zeros(len(target_mean)),  # Initial ksi value
+        jac=True,
+        method="BFGS",
+        tol=tol,
+        options=dict(maxiter=max_iterations),
+    )
 
     return {
-        (group_id, feature): (ksi, converged) for feature, ksi in zip(features, ksis)
+        (group_id, feature): (ksi, res.success) for feature, ksi in zip(features, res.x)
     }
 
 
